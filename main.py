@@ -1,152 +1,263 @@
-import logging
-from aiogram import Bot, Dispatcher, types, executor
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+import asyncio
+from datetime import datetime
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 from config import BOT_TOKEN, ADMIN_ID
-import database as db
-from datetime import date
+from database import (
+    create_db, add_worker, get_workers, check_worker,
+    add_report, get_todays_reports, get_all_reports, delete_worker_by_telegram_id
+)
 
-logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher(storage=MemoryStorage())
 
-# vaqtincha xotirada foydalanuvchi harakati
-pending_actions = {}  # user_id -> action
+# --- FSM holatlari ---
+class AddWorker(StatesGroup):
+    name = State()
+    phone = State()
+    telegram_id = State()
 
-# foydalanuvchi menyusi
-worker_kb = ReplyKeyboardMarkup(resize_keyboard=True)
-worker_kb.add(KeyboardButton("Sotuv qo'shish"))
-worker_kb.add(KeyboardButton("Mening otchotlarim"))
+class ReportState(StatesGroup):
+    summa = State()
+    quantity = State()
+    description = State()
 
-# admin menyusi
-admin_kb = ReplyKeyboardMarkup(resize_keyboard=True)
-admin_kb.add(KeyboardButton("Ishchi qo'shish"))
-admin_kb.add(KeyboardButton("Bugungi achotlar"))
-admin_kb.add(KeyboardButton("Umumiy achotlar"))
+# --- Klaviaturalar ---
+admin_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="👷 Ishchi qo‘shish"), KeyboardButton(text="👥 Mening ishchilarim")],
+        [KeyboardButton(text="📊 Bugungi hisobotlar"), KeyboardButton(text="📈 Umumiy hisobotlar")],
+        [KeyboardButton(text="📩 Ishchiga eslatma yuborish"), KeyboardButton(text="👢 Ishchini o'chirish")]
+    ],
+    resize_keyboard=True
+)
 
-@dp.message_handler(commands=["start"])
-async def cmd_start(message: types.Message):
-    db.create_db()
-    user_id = message.from_user.id
-    if user_id == ADMIN_ID:
-        await message.reply("👋 Assalomu alaykum, Admin!\nMenyuni tanlang:", reply_markup=admin_kb)
+worker_kb = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="🧾 Hisobot yuborish")]],
+    resize_keyboard=True
+)
+
+back_kb = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="⬅️ Orqaga")]],
+    resize_keyboard=True
+)
+
+# --- /start komandasi ---
+@dp.message(lambda m: m.text == "/start")
+async def start_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    await create_db()
+    if message.from_user.id == ADMIN_ID:
+        await message.answer("👋 Assalomu alaykum, Admin 👑", reply_markup=admin_kb)
     else:
-        await message.reply("Salom! Hisobot yuborish uchun menyudan tanlang:", reply_markup=worker_kb)
+        worker = await check_worker(message.from_user.id)
+        if worker:
+            await message.answer(f"👋 Assalomu alaykum, {worker[1]}!\nHisobot yuborish uchun menyudan foydalaning 👇",
+                                 reply_markup=worker_kb)
+        else:
+            await message.answer("❌ Siz ro‘yxatda yo‘qsiz. Admin sizni qo‘shmaguncha botdan foydalana olmaysiz.")
 
-@dp.message_handler(lambda m: m.text == "Ishchi qo'shish")
-async def add_worker_start(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.reply("⛔ Bu buyruq faqat admin uchun.")
-        return
-    pending_actions[message.from_user.id] = "await_add_worker"
-    await message.reply("Qo'shmoqchi bo'lgan ishchining Telegram ID sini yuboring.\nYoki profilini forward qiling:", reply_markup=ReplyKeyboardRemove())
+# --- Orqaga ---
+@dp.message(lambda m: m.text == "⬅️ Orqaga")
+async def back_to_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("⬅️ Asosiy menyu:", reply_markup=admin_kb if message.from_user.id == ADMIN_ID else worker_kb)
 
-@dp.message_handler(lambda message: message.forward_from is not None and pending_actions.get(message.from_user.id) == 'await_add_worker')
-async def add_worker_from_forward(message: types.Message):
+# --- Ishchini o'chirish ---
+@dp.message(lambda m: m.text == "👢 Ishchini o'chirish")
+async def remove_worker_start(message: types.Message):
     if message.from_user.id != ADMIN_ID:
-        return
-    f = message.forward_from
-    tg_id = f.id
-    name = f.username or f.first_name or 'NoName'
-    db.add_worker(tg_id, name)
-    pending_actions.pop(message.from_user.id, None)
-    await message.reply(f"Ishchi qo'shildi ✅\n👤 {name} ({tg_id})", reply_markup=admin_kb)
+        return await message.reply("❌ Bu bo‘lim faqat admin uchun.")
+    workers = await get_workers()
+    if not workers:
+        return await message.reply("📭 Hozircha ishchi yo‘q.", reply_markup=admin_kb)
 
-@dp.message_handler(lambda message: pending_actions.get(message.from_user.id) == 'await_add_worker')
-async def add_worker_by_id(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    text = message.text.strip()
-    parts = text.split(maxsplit=1)
+    for w in workers:
+        name = w[1]
+        phone = w[2]
+        tg_id = w[3]
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="❌ O'chirish", callback_data=f"del:{tg_id}"),
+                InlineKeyboardButton(text="🔙 Bekor", callback_data="cancel")
+            ]
+        ])
+        await message.reply(f"👤 {name}\n📞 {phone}\n🆔 {tg_id}", reply_markup=kb)
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("del:"))
+async def confirm_delete_callback(callback: types.CallbackQuery):
+    await callback.answer()
+    tg_id = callback.data.split(":", 1)[1]
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Ha, o'chir", callback_data=f"confirm_del:{tg_id}"),
+            InlineKeyboardButton(text="❎ Bekor", callback_data="cancel")
+        ]
+    ])
+    await callback.message.reply(f"⚠️ Ishchi (ID: {tg_id}) ni o'chirishni xohlaysizmi? Tasdiqlaysizmi?", reply_markup=confirm_kb)
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("confirm_del:"))
+async def do_delete_callback(callback: types.CallbackQuery):
+    await callback.answer()
+    tg_id = int(callback.data.split(":", 1)[1])
+    await delete_worker_by_telegram_id(tg_id)
     try:
-        tg_id = int(parts[0])
-    except:
-        await message.reply("Iltimos, to‘g‘ri Telegram ID yuboring. Masalan: 123456789", reply_markup=admin_kb)
-        return
-    name = parts[1] if len(parts) > 1 else f"User_{tg_id}"
-    db.add_worker(tg_id, name)
-    pending_actions.pop(message.from_user.id, None)
-    await message.reply(f"Ishchi qo‘shildi ✅\n👤 {name} ({tg_id})", reply_markup=admin_kb)
-
-@dp.message_handler(lambda m: m.text == "Sotuv qo'shish")
-async def start_report(message: types.Message):
-    pending_actions[message.from_user.id] = "await_report"
-    await message.reply("Hisobot matnini yuboring.\nMasalan: `3 ta krossovka sotildi, summa:1500000`", reply_markup=ReplyKeyboardRemove())
-
-@dp.message_handler(lambda m: pending_actions.get(m.from_user.id) == "await_report")
-async def save_report(message: types.Message):
-    user = message.from_user
-    text = message.text
-    amount = 0.0
-    import re
-    m = re.search(r"(?:summa|amount)\s*[:\-]?\s*(\d+[\d\s.]*)", text.lower())
-    if m:
-        amt_str = m.group(1).replace(' ', '').replace('.', '')
-        try:
-            amount = float(amt_str)
-        except:
-            amount = 0.0
-    db.add_report(user.id, user.username or user.first_name or 'NoName', text, amount)
-    pending_actions.pop(message.from_user.id, None)
-    await message.reply("✅ Hisobot qabul qilindi!", reply_markup=worker_kb)
-    try:
-        await bot.send_message(ADMIN_ID, f"📥 Yangi otchot:\n👤 {user.username or user.first_name}\n{text}\n💰 Summa: {amount}")
+        await callback.message.reply(f"✅ Ishchi (ID: {tg_id}) muvaffaqiyatli o'chirildi.", reply_markup=admin_kb)
     except:
         pass
 
-@dp.message_handler(lambda m: m.text == "Mening otchotlarim")
-async def my_reports(message: types.Message):
-    reps = db.get_reports_by_worker(message.from_user.id)
-    if not reps:
-        await message.reply("Sizda hali otchot yo‘q.", reply_markup=worker_kb)
-        return
-    text = "🧾 Sizning so‘nggi 10 ta otchotingiz:\n\n"
-    for r in reps[:10]:
-        text += f"{r['created_at'][:19]} — {r['text']} — 💰 {r.get('amount') or 0}\n"
-    await message.reply(text, reply_markup=worker_kb)
+@dp.callback_query(lambda c: c.data == "cancel")
+async def cancel_callback(callback: types.CallbackQuery):
+    await callback.answer("Bekor qilindi", show_alert=False)
+    try:
+        await callback.message.reply("❎ Amal bekor qilindi.", reply_markup=admin_kb)
+    except:
+        pass
 
-@dp.message_handler(lambda m: m.text == "Bugungi achotlar")
+# --- Ishchi qo‘shish ---
+@dp.message(lambda m: m.text == "👷 Ishchi qo‘shish")
+async def add_worker_start(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return await message.reply("❌ Sizda bu amalni bajarish huquqi yo‘q.")
+    await state.set_state(AddWorker.name)
+    await message.reply("🧑‍💼 Yangi ishchining ismini kiriting:", reply_markup=back_kb)
+
+@dp.message(AddWorker.name)
+async def add_worker_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.reply("📞 Endi ishchining telefon raqamini kiriting:")
+    await state.set_state(AddWorker.phone)
+
+@dp.message(AddWorker.phone)
+async def add_worker_phone(message: types.Message, state: FSMContext):
+    await state.update_data(phone=message.text)
+    await message.reply("📲 Endi ishchining Telegram ID raqamini kiriting:")
+    await state.set_state(AddWorker.telegram_id)
+
+@dp.message(AddWorker.telegram_id)
+async def add_worker_finish(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    name, phone = data.get("name"), data.get("phone")
+    try:
+        telegram_id = int(message.text)
+    except ValueError:
+        return await message.reply("⚠️ Noto‘g‘ri ID. Faqat raqam kiriting.")
+    await add_worker(name, phone, telegram_id)
+    await message.reply(f"✅ Ishchi muvaffaqiyatli qo‘shildi!\n\n👤 Ism: {name}\n📞 Tel: {phone}\n🆔 ID: {telegram_id}",
+                        reply_markup=admin_kb)
+    await state.clear()
+
+# --- Mening ishchilarim ---
+@dp.message(lambda m: m.text == "👥 Mening ishchilarim")
+async def show_workers(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return await message.reply("❌ Bu bo‘lim faqat admin uchun.")
+    workers = await get_workers()
+    if not workers:
+        return await message.reply("📭 Hozircha ishchi qo‘shilmagan.", reply_markup=admin_kb)
+    text = "👥 Mening ishchilarim:\n\n"
+    for w in workers:
+        text += f"👤 {w[1]}\n📞 {w[2]}\n🆔 {w[3]}\n\n"
+    await message.reply(text, reply_markup=admin_kb)
+
+# --- Hisobot yuborish ---
+@dp.message(lambda m: m.text == "🧾 Hisobot yuborish")
+async def report_start(message: types.Message, state: FSMContext):
+    worker = await check_worker(message.from_user.id)
+    if not worker:
+        return await message.reply("❌ Siz ro‘yxatda yo‘qsiz.")
+    await state.set_state(ReportState.summa)
+    await message.reply("💰 Sotuv summasini kiriting:", reply_markup=back_kb)
+
+@dp.message(ReportState.summa)
+async def report_summa(message: types.Message, state: FSMContext):
+    await state.update_data(summa=message.text)
+    await message.reply("⚖️ Nech kilo / nechta sotilganini kiriting:")
+    await state.set_state(ReportState.quantity)
+
+@dp.message(ReportState.quantity)
+async def report_quantity(message: types.Message, state: FSMContext):
+    await state.update_data(quantity=message.text)
+    await message.reply("📝 Mahsulot nomi yoki tavsifini kiriting:")
+    await state.set_state(ReportState.description)
+
+@dp.message(ReportState.description)
+async def report_finish(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    summa = data["summa"]
+    quantity = data["quantity"]
+    description = message.text
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    await add_report(message.from_user.id, summa, quantity, description, now)
+    worker = await check_worker(message.from_user.id)
+    worker_name = worker[1] if worker else "Noma'lum"
+
+    await message.reply(
+        f"✅ Hisobot yuborildi!\n\n💰 {summa}\n⚖️ {quantity}\n📝 {description}\n⏰ {now}",
+        reply_markup=worker_kb
+    )
+
+    await bot.send_message(
+        ADMIN_ID,
+        f"📩 Yangi hisobot keldi!\n\n👤 Ishchi: {worker_name}\n🆔 ID: {message.from_user.id}\n💰 {summa}\n⚖️ {quantity}\n📝 {description}\n⏰ {now}"
+    )
+    await state.clear()
+
+# --- Bugungi hisobotlar ---
+@dp.message(lambda m: m.text == "📊 Bugungi hisobotlar")
 async def today_reports(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    today = date.today().isoformat()
-    reps = db.get_reports_by_date(today)
-    if not reps:
-        await message.reply("Bugun uchun otchot yo‘q.", reply_markup=admin_kb)
-        return
-    text = f"📅 {today} — Bugungi otchotlar:\n\n"
-    total = 0
-    for r in reps:
-        amt = r.get('amount') or 0
-        total += amt
-        text += f"{r['worker_name']}: {r['text']} — 💰 {amt}\n"
-    text += f"\nJami: 💰 {total}"
+    reports = await get_todays_reports()
+    if not reports:
+        return await message.reply("📭 Bugungi hisobot hali ishchilar tomonidan yuborilmagan.",
+                                   reply_markup=admin_kb)
+    text = "📅 Bugungi hisobotlar:\n\n"
+    for r in reports:
+        worker = await check_worker(r[1])
+        worker_name = worker[1] if worker else "Noma'lum"
+        text += f"👤 {worker_name}\n💰 {r[2]}\n⚖️ {r[3]}\n📝 {r[4]}\n⏰ {r[5]}\n\n"
     await message.reply(text, reply_markup=admin_kb)
 
-@dp.message_handler(lambda m: m.text == "Umumiy achotlar")
+# --- Umumiy hisobotlar ---
+@dp.message(lambda m: m.text == "📈 Umumiy hisobotlar")
 async def all_reports(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    reps = db.get_all_reports()
-    if not reps:
-        await message.reply("Hozircha otchotlar yo‘q.", reply_markup=admin_kb)
-        return
-    text = "📚 So‘nggi 20 ta otchot:\n\n"
-    total = 0
-    for r in reps[:20]:
-        amt = r.get('amount') or 0
-        total += amt
-        text += f"{r['created_at'][:19]} — {r['worker_name']}: {r['text']} — 💰 {amt}\n"
-    text += f"\nJami: 💰 {total}"
+    reports = await get_all_reports()
+    if not reports:
+        return await message.reply("📭 Hali hech qanday hisobot yuborilmagan.", reply_markup=admin_kb)
+    text = "📊 Umumiy hisobotlar:\n\n"
+    for r in reports:
+        worker = await check_worker(r[1])
+        worker_name = worker[1] if worker else "Noma'lum"
+        text += f"👤 {worker_name}\n💰 {r[2]}\n⚖️ {r[3]}\n📝 {r[4]}\n⏰ {r[5]}\n\n"
     await message.reply(text, reply_markup=admin_kb)
 
-@dp.message_handler()
-async def fallback(message: types.Message):
-    if message.from_user.id == ADMIN_ID:
-        await message.reply("Admin menyu:", reply_markup=admin_kb)
-    else:
-        await message.reply("Foydalanuvchi menyu:", reply_markup=worker_kb)
+# --- Ishchiga eslatma yuborish ---
+@dp.message(lambda m: m.text == "📩 Ishchiga eslatma yuborish")
+async def remind_workers(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    workers = await get_workers()
+    if not workers:
+        return await message.reply("❌ Hozircha ishchilar yo‘q.")
+    for w in workers:
+        try:
+            await bot.send_message(w[3], "📨 Iltimos, bugungi hisobotni yuboring. Admin kutmoqda.")
+        except:
+            pass
+    await message.reply("📨 Eslatma barcha ishchilarga yuborildi ✅", reply_markup=admin_kb)
+
+# --- Botni ishga tushirish ---
+async def main():
+    await create_db()
+    print("✅ Bot ishga tushmoqda...")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    print("🤖 Bot ishga tushmoqda...")
-    db.create_db()
-    executor.start_polling(dp, skip_updates=True)
+    asyncio.run(main())
